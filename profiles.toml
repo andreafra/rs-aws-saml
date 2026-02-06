@@ -13,19 +13,19 @@ otp = "input#otp"
 otp_submit = "#submit-dissms"
 saml_response = "input[name='SAMLResponse']"
 
-[[profiles.accounts]]
+[[aws.accounts]]
 label = "jedi_test"
 iam-role = "polimi-framework-developer"
 saml-provider = "idp-polimi"
 account = "562324089431"
 
-[[profiles.accounts]]
+[[aws.accounts]]
 label = "jedi_prod"
 iam-role = "polimi-framework-developer"
 saml-provider = "idp-polimi"
 account = "108034374417"
 
-[[profiles.accounts]]
+[[aws.accounts]]
 label = "jedi_dev"
 iam-role = "polimi-framework-developer"
 saml-provider = "idp-polimi"

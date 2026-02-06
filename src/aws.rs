@@ -1,9 +1,15 @@
-use std::{path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::Client;
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use directories::BaseDirs;
 use configparser::ini::Ini;
 
@@ -16,6 +22,11 @@ pub struct AwsCredentials {
     pub secret_access_key: String,
     pub session_token: String,
     pub expiration: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialsStatus {
+    pub expiration: Option<DateTime>,
 }
 
 pub fn assume_roles_with_saml(
@@ -84,12 +95,7 @@ pub fn write_credentials(creds: &[AwsCredentials]) -> Result<PathBuf> {
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    let mut ini = Ini::new();
-    if path.exists() {
-        ini.load(path.to_string_lossy().as_ref())
-            .map_err(|err| anyhow::anyhow!(err))
-            .context("Failed to read existing credentials file")?;
-    }
+    let mut ini = load_credentials_ini(&path)?;
 
     for cred in creds {
         ini.set(
@@ -121,4 +127,139 @@ fn credentials_path() -> Result<PathBuf> {
     let base_dirs =
         BaseDirs::new().context("Unable to determine home directory for credentials file")?;
     Ok(base_dirs.home_dir().join(".aws").join("credentials"))
+}
+
+pub fn credentials_valid(label: &str) -> Result<bool> {
+    let expiration = read_credentials_entry(label)?;
+    let Some(expiration) = expiration else {
+        return Ok(false);
+    };
+    let now = now_datetime()?;
+    Ok(expiration.as_nanos() > now.as_nanos())
+}
+
+pub fn set_default_profile(label: &str) -> Result<PathBuf> {
+    let path = credentials_path()?;
+    let mut ini = load_credentials_ini(&path)?;
+
+    let access_key_id = ini
+        .get(label, "aws_access_key_id")
+        .ok_or_else(|| anyhow!("Missing aws_access_key_id for {}", label))?;
+    let secret_access_key = ini
+        .get(label, "aws_secret_access_key")
+        .ok_or_else(|| anyhow!("Missing aws_secret_access_key for {}", label))?;
+    let session_token = ini
+        .get(label, "aws_session_token")
+        .ok_or_else(|| anyhow!("Missing aws_session_token for {}", label))?;
+    let expiration = ini.get(label, "expiration");
+
+    ini.set("default", "aws_access_key_id", Some(access_key_id));
+    ini.set("default", "aws_secret_access_key", Some(secret_access_key));
+    ini.set("default", "aws_session_token", Some(session_token));
+    if let Some(expiration) = expiration {
+        ini.set("default", "expiration", Some(expiration));
+    }
+
+    ini.write(path.to_string_lossy().as_ref())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn read_credentials_status(labels: &[String]) -> Result<HashMap<String, CredentialsStatus>> {
+    let path = credentials_path()?;
+    let mut status = HashMap::new();
+    if !path.exists() {
+        for label in labels {
+            status.insert(
+                label.clone(),
+                CredentialsStatus {
+                    expiration: None,
+                },
+            );
+        }
+        return Ok(status);
+    }
+
+    let ini = load_credentials_ini(&path)?;
+    let now = now_datetime()?;
+    for label in labels {
+        let expiration = ini
+            .get(label, "expiration")
+            .and_then(|value| parse_expiration(&value));
+        status.insert(
+            label.clone(),
+            CredentialsStatus {
+                expiration,
+            },
+        );
+    }
+    Ok(status)
+}
+
+pub fn detect_default_profile(labels: &[String]) -> Result<Option<String>> {
+    let path = credentials_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ini = load_credentials_ini(&path)?;
+    let default_access = ini.get("default", "aws_access_key_id");
+    let default_secret = ini.get("default", "aws_secret_access_key");
+    let default_token = ini.get("default", "aws_session_token");
+
+    let Some(default_access) = default_access else { return Ok(None); };
+    let Some(default_secret) = default_secret else { return Ok(None); };
+    let Some(default_token) = default_token else { return Ok(None); };
+
+    for label in labels {
+        let access = ini.get(label, "aws_access_key_id");
+        let secret = ini.get(label, "aws_secret_access_key");
+        let token = ini.get(label, "aws_session_token");
+        if access.as_deref() == Some(default_access.as_str())
+            && secret.as_deref() == Some(default_secret.as_str())
+            && token.as_deref() == Some(default_token.as_str())
+        {
+            return Ok(Some(label.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_credentials_entry(label: &str) -> Result<Option<DateTime>> {
+    let path = credentials_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ini = load_credentials_ini(&path)?;
+
+    let expiration = ini
+        .get(label, "expiration")
+        .and_then(|value| parse_expiration(&value));
+
+    Ok(expiration)
+}
+
+fn parse_expiration(value: &str) -> Option<DateTime> {
+    DateTime::from_str(value, Format::DateTimeWithOffset)
+        .or_else(|_| DateTime::from_str(value, Format::DateTime))
+        .ok()
+}
+
+fn now_datetime() -> Result<DateTime> {
+    Ok(DateTime::from_secs(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System time before Unix epoch")?
+            .as_secs() as i64,
+    ))
+}
+
+fn load_credentials_ini(path: &PathBuf) -> Result<Ini> {
+    let mut ini = Ini::new();
+    if path.exists() {
+        ini.load(path.to_string_lossy().as_ref())
+            .map_err(|err| anyhow!(err))
+            .context("Failed to read existing credentials file")?;
+    }
+    Ok(ini)
 }

@@ -2,13 +2,17 @@ mod config;
 mod aws;
 mod headless;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::{button::*, *};
+use gpui_component::IndexPath;
 
 use crate::config::{
     config_path, load_config, load_config_text, parse_config, save_config_text, AwsAccount, Config,
@@ -28,6 +32,7 @@ enum AuthEvent {
         accounts: usize,
     },
     Failed { profile: String, error: String },
+    CredentialsUpdated { labels: Vec<String> },
 }
 
 pub struct AppState {
@@ -38,10 +43,14 @@ pub struct AppState {
     headless: bool,
     view: ViewMode,
     config_editor: Entity<InputState>,
+    aws_select: Entity<SelectState<SearchableVec<String>>>,
+    default_profile: Option<String>,
+    account_status: HashMap<String, aws::CredentialsStatus>,
     config_path: PathBuf,
     config_error: Option<String>,
     config_dirty: bool,
-    _subscriptions: Vec<Subscription>,
+    _editor_subscription: Subscription,
+    _select_subscription: Subscription,
 }
 
 impl AppState {
@@ -70,7 +79,7 @@ impl AppState {
             state.set_value(config_text, window, cx);
         });
 
-        let subscriptions = vec![cx.subscribe_in(
+        let editor_subscription = cx.subscribe_in(
             &config_editor,
             window,
             |this: &mut AppState, _state, event: &InputEvent, _window, cx| {
@@ -82,7 +91,38 @@ impl AppState {
                     cx.notify();
                 }
             },
-        )];
+        );
+
+        let aws_labels = match &config {
+            Ok(config) => config
+                .aws
+                .accounts
+                .iter()
+                .map(|account| account.label.clone())
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        let account_status = aws::read_credentials_status(&aws_labels).unwrap_or_default();
+        let default_profile = aws::detect_default_profile(&aws_labels).ok().flatten();
+        let selected_index = default_profile
+            .as_ref()
+            .and_then(|label| aws_labels.iter().position(|item| item == label))
+            .map(|idx| IndexPath::default().row(idx));
+        let aws_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(aws_labels), selected_index, window, cx)
+                .searchable(true)
+        });
+        let select_subscription = cx.subscribe_in(
+            &aws_select,
+            window,
+            |this: &mut AppState, _state, event: &SelectEvent<SearchableVec<String>>, _window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.default_profile = Some(value.clone());
+                    this.push_status(format!("Default profile selected: {}", value));
+                    cx.notify();
+                }
+            },
+        );
 
         Self {
             config,
@@ -92,10 +132,89 @@ impl AppState {
             headless: true,
             view: ViewMode::Profiles,
             config_editor,
+            aws_select,
+            default_profile,
+            account_status,
             config_path,
             config_error,
             config_dirty: false,
-            _subscriptions: subscriptions,
+            _editor_subscription: editor_subscription,
+            _select_subscription: select_subscription,
+        }
+    }
+
+    fn refresh_aws_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let labels = match &self.config {
+            Ok(config) => config
+                .aws
+                .accounts
+                .iter()
+                .map(|account| account.label.clone())
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+
+        if self.default_profile.is_none() {
+            self.default_profile = aws::detect_default_profile(&labels).ok().flatten();
+        }
+
+        let selected_index = self
+            .default_profile
+            .as_ref()
+            .and_then(|label| labels.iter().position(|item| item == label))
+            .map(|idx| IndexPath::default().row(idx));
+
+        if selected_index.is_none() {
+            self.default_profile = None;
+        }
+
+        if let Ok(status) = aws::read_credentials_status(&labels) {
+            self.account_status = status;
+        }
+
+        let aws_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(labels), selected_index, window, cx).searchable(true)
+        });
+        let select_subscription = cx.subscribe_in(
+            &aws_select,
+            window,
+            |this: &mut AppState, _state, event: &SelectEvent<SearchableVec<String>>, _window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.default_profile = Some(value.clone());
+                    this.push_status(format!("Default profile selected: {}", value));
+                    cx.notify();
+                }
+            },
+        );
+
+        self.aws_select = aws_select;
+        self._select_subscription = select_subscription;
+    }
+
+    fn format_account_expiration(&self, label: &str) -> String {
+        let Some(status) = self.account_status.get(label) else {
+            return "no credentials".to_string();
+        };
+        let Some(expiration) = &status.expiration else {
+            return "no expiration".to_string();
+        };
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return "unknown".to_string();
+        };
+        let now_secs = now.as_secs() as i64;
+        let exp_secs = expiration.secs();
+        if exp_secs <= now_secs {
+            return "expired".to_string();
+        }
+        let remaining = (exp_secs - now_secs) as u64;
+        if remaining >= 3600 {
+            let hours = remaining / 3600;
+            let minutes = (remaining % 3600) / 60;
+            format!("expires in {}h{}m", hours, minutes)
+        } else {
+            let minutes = remaining / 60;
+            let seconds = remaining % 60;
+            format!("expires in {}m{}s", minutes, seconds)
         }
     }
 
@@ -123,6 +242,11 @@ impl AppState {
             }
             AuthEvent::Failed { profile, error } => {
                 self.push_status(format!("Auth failed for {}: {}", profile, error));
+            }
+            AuthEvent::CredentialsUpdated { labels } => {
+                if let Ok(status) = aws::read_credentials_status(&labels) {
+                    self.account_status = status;
+                }
             }
         }
     }
@@ -192,21 +316,22 @@ impl Render for AppState {
             ViewMode::Profiles => match &self.config {
                 Ok(config) => {
                     content = content.child(format!("Login profile: {}", config.login.name));
-                    if config.profiles.accounts.is_empty() {
+                    if config.aws.accounts.is_empty() {
                         content = content.child("No AWS accounts configured.");
                     } else {
                         let mut accounts = div().v_flex().gap_1();
-                        for account in &config.profiles.accounts {
+                        for account in &config.aws.accounts {
+                            let expiration = self.format_account_expiration(&account.label);
                             accounts = accounts.child(format!(
-                                "{} ({} / {})",
-                                account.label, account.account, account.iam_role
+                                "{} ({} / {}) - {}",
+                                account.label, account.account, account.iam_role, expiration
                             ));
                         }
                         content = content.child(accounts);
                     }
 
                     let login = config.login.clone();
-                    let accounts = config.profiles.accounts.clone();
+                    let accounts = config.aws.accounts.clone();
                     content = content.child(
                         Button::new("auth-all")
                             .primary()
@@ -221,8 +346,60 @@ impl Render for AppState {
                                     accounts.clone(),
                                     this.headless,
                                     this.status_tx.clone(),
+                                    this.default_profile.clone(),
                                 );
                             })),
+                    );
+
+                    let login = config.login.clone();
+                    let accounts = config.aws.accounts.clone();
+                    content = content.child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child("Default profile:")
+                            .child(Select::new(&self.aws_select).placeholder("Select profile"))
+                            .child(
+                                Button::new("set-default")
+                                    .label("Set Default")
+                                    .on_click(cx.listener(move |this, _event, _window, _cx| {
+                                        let Some(label) = this.default_profile.clone() else {
+                                            this.push_status("Select a default profile first");
+                                            return;
+                                        };
+
+                                        match aws::credentials_valid(&label) {
+                                            Ok(true) => match aws::set_default_profile(&label) {
+                                                Ok(path) => {
+                                                    this.push_status(format!(
+                                                        "Default profile set to {} ({})",
+                                                        label,
+                                                        path.display()
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    this.push_status(format!(
+                                                        "Failed to set default profile: {err:?}"
+                                                    ));
+                                                }
+                                            },
+                                            Ok(false) | Err(_) => {
+                                                this.push_status(format!(
+                                                    "Credentials for {} expired or missing; re-authenticating",
+                                                    label
+                                                ));
+                                                start_auth(
+                                                    login.clone(),
+                                                    accounts.clone(),
+                                                    this.headless,
+                                                    this.status_tx.clone(),
+                                                    Some(label),
+                                                );
+                                            }
+                                        }
+                                    })),
+                            ),
                     );
                 }
                 Err(message) => {
@@ -254,7 +431,7 @@ impl Render for AppState {
                             Button::new("save-config")
                                 .primary()
                                 .label("Save")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                .on_click(cx.listener(|this, _event, window, cx| {
                                     let contents = this.config_editor.read(cx).value();
                                     match save_config_text(contents.as_str()) {
                                         Ok(path) => {
@@ -264,6 +441,7 @@ impl Render for AppState {
                                                     this.config = Ok(config);
                                                     this.config_error = None;
                                                     this.config_dirty = false;
+                                                    this.refresh_aws_select(window, cx);
                                                     this.push_status("Config saved");
                                                 }
                                                 Err(err) => {
@@ -297,6 +475,7 @@ impl Render for AppState {
                                                 Ok(config) => {
                                                     this.config = Ok(config);
                                                     this.config_error = None;
+                                                    this.refresh_aws_select(window, cx);
                                                 }
                                                 Err(err) => {
                                                     this.config = Err(err.to_string());
@@ -346,6 +525,7 @@ fn start_auth(
     accounts: Vec<AwsAccount>,
     headless: bool,
     status_tx: Sender<AuthEvent>,
+    default_profile: Option<String>,
 ) {
     std::thread::spawn(move || {
         let send_status = |tx: &Sender<AuthEvent>, message: &str| {
@@ -386,11 +566,33 @@ fn start_auth(
                         Ok(path) => {
                             send_status(
                                 &status_tx,
-                                &format!(
-                                "Credentials written to {}",
-                                path.display()
-                            ),
+                                &format!("Credentials written to {}", path.display()),
                             );
+                            if let Some(label) = default_profile.clone() {
+                                match aws::set_default_profile(&label) {
+                                    Ok(default_path) => {
+                                        send_status(
+                                            &status_tx,
+                                            &format!(
+                                                "Default profile set to {} ({})",
+                                                label,
+                                                default_path.display()
+                                            ),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_status(
+                                            &status_tx,
+                                            &format!(
+                                                "Failed to set default profile: {err:?}"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            let labels = accounts.iter().map(|a| a.label.clone()).collect();
+                            let _ = status_tx.send_blocking(AuthEvent::CredentialsUpdated { labels });
                             let _ = status_tx.send_blocking(AuthEvent::Finished {
                                 profile: login.name.clone(),
                                 accounts: creds.len(),

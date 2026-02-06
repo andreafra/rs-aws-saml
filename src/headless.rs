@@ -5,6 +5,7 @@ use headless_chrome::{
     Browser, LaunchOptionsBuilder, Tab,
     protocol::cdp::Fetch::{RequestPattern, RequestStage, events::RequestPausedEvent},
 };
+use serde_json::Value as JsonValue;
 use totp_rs::{Algorithm, Secret, TOTP};
 use url::form_urlencoded;
 
@@ -125,14 +126,39 @@ fn extract_saml_response_from_post_data(post_data: &str) -> Option<String> {
     None
 }
 
+fn fast_set_value(
+    element: &headless_chrome::browser::tab::element::Element<'_>,
+    value: &str,
+) -> Result<()> {
+    let script = r#"
+        function(value) {
+            const input = this;
+            try { input.focus(); } catch (_) {}
+            const proto = Object.getPrototypeOf(input);
+            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (descriptor && descriptor.set) {
+                descriptor.set.call(input, value);
+            } else {
+                input.value = value;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    "#;
+    element.call_js_fn(script, vec![JsonValue::String(value.to_string())], false)?;
+    Ok(())
+}
+
 fn fill_input(tab: &Tab, selector: &str, value: &str) -> Result<()> {
     let element = tab
         .wait_for_element(selector)
         .with_context(|| format!("Failed to find element {}", selector))?;
-    element.click().ok();
-    element
-        .type_into(value)
-        .with_context(|| format!("Failed to type into {}", selector))?;
+    if fast_set_value(&element, value).is_err() {
+        element.click().ok();
+        element
+            .type_into(value)
+            .with_context(|| format!("Failed to type into {}", selector))?;
+    }
     Ok(())
 }
 

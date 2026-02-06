@@ -8,7 +8,7 @@ use serde::Deserialize;
 pub struct Config {
     pub login: LoginProfile,
     #[serde(default)]
-    pub profiles: ProfilesSection,
+    pub aws: AwsSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,7 +25,7 @@ pub struct LoginProfile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ProfilesSection {
+pub struct AwsSection {
     #[serde(default)]
     pub accounts: Vec<AwsAccount>,
 }
