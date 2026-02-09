@@ -1,7 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,11 +85,8 @@ pub fn config_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    if let Some(project_dirs) = ProjectDirs::from("com", "example", "rs-aws-saml") {
-        let path = project_dirs.config_dir().join("profiles.toml");
-        if path.exists() {
-            return path;
-        }
+    if let Some(base_dirs) = BaseDirs::new() {
+        return base_dirs.home_dir().join(".rs-aws-saml.toml");
     }
 
     PathBuf::from("profiles.toml")
