@@ -4,16 +4,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::Client;
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
-use directories::BaseDirs;
 use configparser::ini::Ini;
+use directories::BaseDirs;
 
 use crate::config::AwsAccount;
+
+const CREDENTIALS_ROOT_SECTION: &str = "__root__";
 
 #[derive(Debug, Clone)]
 pub struct AwsCredentials {
@@ -181,7 +183,6 @@ pub fn read_credentials_status(labels: &[String]) -> Result<HashMap<String, Cred
     }
 
     let ini = load_credentials_ini(&path)?;
-    let now = now_datetime()?;
     for label in labels {
         let expiration = ini
             .get(label, "expiration")
@@ -256,10 +257,23 @@ fn now_datetime() -> Result<DateTime> {
 
 fn load_credentials_ini(path: &PathBuf) -> Result<Ini> {
     let mut ini = Ini::new();
+    ini.set_default_section(CREDENTIALS_ROOT_SECTION);
     if path.exists() {
         ini.load(path.to_string_lossy().as_ref())
             .map_err(|err| anyhow!(err))
             .context("Failed to read existing credentials file")?;
     }
+    normalize_credentials_ini(&mut ini);
     Ok(ini)
+}
+
+fn normalize_credentials_ini(ini: &mut Ini) {
+    let map = ini.get_mut_map();
+    let root_map = map.remove(CREDENTIALS_ROOT_SECTION);
+    if let Some(root_map) = root_map {
+        let default_map = map.entry("default".to_string()).or_insert_with(HashMap::new);
+        for (key, value) in root_map {
+            default_map.entry(key).or_insert(value);
+        }
+    }
 }

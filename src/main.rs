@@ -1,6 +1,7 @@
-mod config;
 mod aws;
+mod config;
 mod headless;
+mod ui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,29 +9,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use gpui::*;
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
-use gpui_component::{button::*, *};
 use gpui_component::IndexPath;
+use gpui_component::checkbox::Checkbox;
+use gpui_component::group_box::{GroupBox, GroupBoxVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
+use gpui_component::{button::*, *};
 
 use crate::config::{
-    config_path, load_config, load_config_text, parse_config, save_config_text, AwsAccount, Config,
-    LoginProfile,
+    AwsAccount, Config, LoginProfile, config_path, load_config, load_config_text, parse_config,
+    save_config_text,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
+pub(crate) enum ViewMode {
     Profiles,
     Config,
+    Settings,
+    Logs,
 }
 
 enum AuthEvent {
     Status(String),
-    Finished {
-        profile: String,
-        accounts: usize,
-    },
+    Finished { profile: String, accounts: usize },
     Failed { profile: String, error: String },
     CredentialsUpdated { labels: Vec<String> },
 }
@@ -115,7 +117,11 @@ impl AppState {
         let select_subscription = cx.subscribe_in(
             &aws_select,
             window,
-            |this: &mut AppState, _state, event: &SelectEvent<SearchableVec<String>>, _window, cx| {
+            |this: &mut AppState,
+             _state,
+             event: &SelectEvent<SearchableVec<String>>,
+             _window,
+             cx| {
                 if let SelectEvent::Confirm(Some(value)) = event {
                     this.default_profile = Some(value.clone());
                     this.push_status(format!("Default profile selected: {}", value));
@@ -173,12 +179,17 @@ impl AppState {
         }
 
         let aws_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(labels), selected_index, window, cx).searchable(true)
+            SelectState::new(SearchableVec::new(labels), selected_index, window, cx)
+                .searchable(true)
         });
         let select_subscription = cx.subscribe_in(
             &aws_select,
             window,
-            |this: &mut AppState, _state, event: &SelectEvent<SearchableVec<String>>, _window, cx| {
+            |this: &mut AppState,
+             _state,
+             event: &SelectEvent<SearchableVec<String>>,
+             _window,
+             cx| {
                 if let SelectEvent::Confirm(Some(value)) = event {
                     this.default_profile = Some(value.clone());
                     this.push_status(format!("Default profile selected: {}", value));
@@ -228,17 +239,58 @@ impl AppState {
         }
     }
 
+    pub(crate) fn set_default_profile_action(
+        &mut self,
+        label: String,
+        login: LoginProfile,
+        accounts: Vec<AwsAccount>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.default_profile = Some(label.clone());
+        self.aws_select.update(cx, |state, cx| {
+            state.set_selected_value(&label, window, cx);
+        });
+
+        match aws::credentials_valid(&label) {
+            Ok(true) => match aws::set_default_profile(&label) {
+                Ok(path) => {
+                    self.push_status(format!(
+                        "Default profile set to {} ({})",
+                        label,
+                        path.display()
+                    ));
+                    if let Ok(status) = aws::read_credentials_status(
+                        &accounts.iter().map(|a| a.label.clone()).collect::<Vec<_>>(),
+                    ) {
+                        self.account_status = status;
+                    }
+                }
+                Err(err) => {
+                    self.push_status(format!("Failed to set default profile: {err:?}"));
+                }
+            },
+            Ok(false) | Err(_) => {
+                self.push_status(format!(
+                    "Credentials for {} expired or missing; re-authenticating",
+                    label
+                ));
+                start_auth(
+                    login,
+                    accounts,
+                    self.headless,
+                    self.status_tx.clone(),
+                    Some(label),
+                );
+            }
+        }
+    }
+
     fn apply_event(&mut self, event: AuthEvent) {
         match event {
             AuthEvent::Status(message) => self.push_status(message),
-            AuthEvent::Finished {
-                profile,
-                accounts,
-            } => {
-                self.push_status(format!(
-                    "Completed {} ({} accounts)",
-                    profile, accounts
-                ));
+            AuthEvent::Finished { profile, accounts } => {
+                self.push_status(format!("Completed {} ({} accounts)", profile, accounts));
             }
             AuthEvent::Failed { profile, error } => {
                 self.push_status(format!("Auth failed for {}: {}", profile, error));
@@ -254,87 +306,66 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut content = div()
+        let tabs = ui::tabs::main_tabs(self.view, cx);
+        let top_bar = div()
             .v_flex()
-            .gap_3()
-            .size_full()
-            .child("AWS SAML Auth")
+            .gap_2()
             .child(
                 div()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new("view-profiles")
-                            .label("Profiles")
-                            .with_variant(if self.view == ViewMode::Profiles {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .on_click(cx.listener(|this, _event, _window, _cx| {
-                                this.view = ViewMode::Profiles;
-                            })),
-                    )
-                    .child(
-                        Button::new("view-config")
-                            .label("Edit Config")
-                            .with_variant(if self.view == ViewMode::Config {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .on_click(cx.listener(|this, _event, _window, _cx| {
-                                this.view = ViewMode::Config;
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("headless")
-                            .label("Headless (off to debug)")
-                            .checked(self.headless)
-                            .on_click(cx.listener(|this, checked, _window, _cx| {
-                                this.headless = *checked;
-                                if this.headless {
-                                    this.push_status("Headless enabled");
-                                } else {
-                                    this.push_status("Headless disabled");
-                                }
-                            })),
-                    ),
+                    .child("AWS SAML Auth")
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_3xl(),
             )
-            .child(format!("Status: {}", self.status));
+            .child(tabs);
 
-        if !self.status_log.is_empty() {
-            let mut log = div().v_flex().gap_1();
-            for entry in self.status_log.iter().rev() {
-                log = log.child(entry.clone());
-            }
-            content = content.child(log);
-        }
+        let mut content = div()
+            .v_flex()
+            .gap_4()
+            .size_full()
+            .paddings(Edges::all(px(24.)))
+            .child(top_bar);
+        // .child(format!("Status: {}", self.status));
+
+        let mut body = div().v_flex().gap_4().flex_1().min_h(px(0.));
 
         match self.view {
             ViewMode::Profiles => match &self.config {
                 Ok(config) => {
-                    content = content.child(format!("Login profile: {}", config.login.name));
                     if config.aws.accounts.is_empty() {
-                        content = content.child("No AWS accounts configured.");
+                        body = body.child("No AWS accounts configured.");
                     } else {
-                        let mut accounts = div().v_flex().gap_1();
-                        for account in &config.aws.accounts {
+                        let mut accounts = div()
+                            .v_flex()
+                            .gap_3()
+                            .flex_1()
+                            .min_h(px(100.))
+                            .overflow_y_scrollbar();
+                        for (index, account) in config.aws.accounts.iter().enumerate() {
                             let expiration = self.format_account_expiration(&account.label);
-                            accounts = accounts.child(format!(
-                                "{} ({} / {}) - {}",
-                                account.label, account.account, account.iam_role, expiration
-                            ));
+                            let label = account.label.clone();
+                            let login = config.login.clone();
+                            let accounts_list = config.aws.accounts.clone();
+                            let default_profile = self.default_profile.as_deref();
+                            let card = ui::cards::account_card(
+                                account,
+                                expiration,
+                                index,
+                                label,
+                                login,
+                                accounts_list,
+                                default_profile,
+                                cx,
+                            );
+                            accounts = accounts.child(card.mb_2());
                         }
-                        content = content.child(accounts);
+                        body = body.child(accounts);
                     }
 
                     let login = config.login.clone();
                     let accounts = config.aws.accounts.clone();
-                    content = content.child(
+                    body = body.child(
                         Button::new("auth-all")
-                            .primary()
+                            .icon(IconName::User)
                             .label("Authenticate And Assume Roles")
                             .on_click(cx.listener(move |this, _event, _window, _cx| {
                                 this.push_status(format!(
@@ -350,116 +381,79 @@ impl Render for AppState {
                                 );
                             })),
                     );
-
-                    let login = config.login.clone();
-                    let accounts = config.aws.accounts.clone();
-                    content = content.child(
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child("Default profile:")
-                            .child(Select::new(&self.aws_select).placeholder("Select profile"))
-                            .child(
-                                Button::new("set-default")
-                                    .label("Set Default")
-                                    .on_click(cx.listener(move |this, _event, _window, _cx| {
-                                        let Some(label) = this.default_profile.clone() else {
-                                            this.push_status("Select a default profile first");
-                                            return;
-                                        };
-
-                                        match aws::credentials_valid(&label) {
-                                            Ok(true) => match aws::set_default_profile(&label) {
-                                                Ok(path) => {
-                                                    this.push_status(format!(
-                                                        "Default profile set to {} ({})",
-                                                        label,
-                                                        path.display()
-                                                    ));
-                                                }
-                                                Err(err) => {
-                                                    this.push_status(format!(
-                                                        "Failed to set default profile: {err:?}"
-                                                    ));
-                                                }
-                                            },
-                                            Ok(false) | Err(_) => {
-                                                this.push_status(format!(
-                                                    "Credentials for {} expired or missing; re-authenticating",
-                                                    label
-                                                ));
-                                                start_auth(
-                                                    login.clone(),
-                                                    accounts.clone(),
-                                                    this.headless,
-                                                    this.status_tx.clone(),
-                                                    Some(label),
-                                                );
-                                            }
-                                        }
-                                    })),
-                            ),
-                    );
                 }
                 Err(message) => {
                     content = content.child(format!("Config error: {message}"));
                 }
             },
             ViewMode::Config => {
-                content = content
-                    .child(format!("Editing: {}", self.config_path.display()))
-                    .child(if self.config_dirty {
-                        "Unsaved changes"
-                    } else {
-                        "Saved"
-                    });
+                body = body
+                    .child(
+                        GroupBox::new()
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .justify_start()
+                                    .gap_2()
+                                    .child(IconName::File)
+                                    .child(format!(
+                                        "Editing {}",
+                                        self.config_path
+                                            .canonicalize()
+                                            .unwrap_or_else(|_| self.config_path.clone())
+                                            .display()
+                                    ))
+                            ),
+                    );
 
                 if let Some(error) = &self.config_error {
-                    content = content.child(format!("Config error: {error}"));
+                    body = body.child(format!("Config error: {error}"));
                 }
 
-                content = content.child(
-                    div().size_full().child(Input::new(&self.config_editor).h_full()),
+                body = body.child(
+                    div()
+                        .size_full()
+                        .child(Input::new(&self.config_editor).h_full()),
                 );
 
-                content = content.child(
+                body = body.child(
                     div()
                         .h_flex()
                         .gap_2()
-                        .child(
-                            Button::new("save-config")
-                                .primary()
-                                .label("Save")
-                                .on_click(cx.listener(|this, _event, window, cx| {
-                                    let contents = this.config_editor.read(cx).value();
-                                    match save_config_text(contents.as_str()) {
-                                        Ok(path) => {
-                                            this.config_path = path;
-                                            match parse_config(contents.as_str()) {
-                                                Ok(config) => {
-                                                    this.config = Ok(config);
-                                                    this.config_error = None;
-                                                    this.config_dirty = false;
-                                                    this.refresh_aws_select(window, cx);
-                                                    this.push_status("Config saved");
-                                                }
-                                                Err(err) => {
-                                                    this.config = Err(err.to_string());
-                                                    this.config_error = Some(err.to_string());
-                                                    this.push_status(
-                                                        "Config saved, but parsing failed",
-                                                    );
-                                                }
+                        .child(Button::new("save-config")
+                            .primary()
+                            .label("Save")
+                            .disabled(!self.config_dirty)
+                            .on_click(
+                            cx.listener(|this, _event, window, cx| {
+                                let contents = this.config_editor.read(cx).value();
+                                match save_config_text(contents.as_str()) {
+                                    Ok(path) => {
+                                        this.config_path = path;
+                                        match parse_config(contents.as_str()) {
+                                            Ok(config) => {
+                                                this.config = Ok(config);
+                                                this.config_error = None;
+                                                this.config_dirty = false;
+                                                this.refresh_aws_select(window, cx);
+                                                this.push_status("Config saved");
+                                            }
+                                            Err(err) => {
+                                                this.config = Err(err.to_string());
+                                                this.config_error = Some(err.to_string());
+                                                this.push_status(
+                                                    "Config saved, but parsing failed",
+                                                );
                                             }
                                         }
-                                        Err(err) => {
-                                            this.config_error = Some(err.to_string());
-                                            this.push_status("Config save failed");
-                                        }
                                     }
-                                })),
-                        )
+                                    Err(err) => {
+                                        this.config_error = Some(err.to_string());
+                                        this.push_status("Config save failed");
+                                    }
+                                }
+                            }),
+                        ))
                         .child(
                             Button::new("reload-config")
                                 .ghost()
@@ -494,29 +488,64 @@ impl Render for AppState {
                         ),
                 );
             }
+            ViewMode::Settings => {
+                body = body.child(
+                    GroupBox::new().outline().title("Browser").child(
+                        Checkbox::new("headless")
+                            .label("Headless (off to debug)")
+                            .checked(self.headless)
+                            .on_click(cx.listener(|this, checked, _window, _cx| {
+                                this.headless = *checked;
+                                if this.headless {
+                                    this.push_status("Headless enabled");
+                                } else {
+                                    this.push_status("Headless disabled");
+                                }
+                            })),
+                    ),
+                );
+            }
+            ViewMode::Logs => {
+                let mut log_list = div()
+                    .v_flex()
+                    .gap_1()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scrollbar();
+                if self.status_log.is_empty() {
+                    log_list = log_list.child("No logs yet.");
+                } else {
+                    for entry in self.status_log.iter().rev() {
+                        log_list = log_list.child(entry.clone());
+                    }
+                }
+                body = body.child(log_list);
+            }
         }
 
-        content
+        content.child(body)
     }
 }
 
 fn start_status_listener(cx: &mut Context<AppState>, status_rx: Receiver<AuthEvent>) {
-    cx.spawn(move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
-        let app = cx.clone();
-        async move {
-            let mut app = app;
-            while let Ok(event) = status_rx.recv().await {
-                if let Some(view) = this.upgrade() {
-                    let _ = view.update(&mut app, |this, cx| {
-                        this.apply_event(event);
-                        cx.notify();
-                    });
-                } else {
-                    break;
+    cx.spawn(
+        move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+            let app = cx.clone();
+            async move {
+                let mut app = app;
+                while let Ok(event) = status_rx.recv().await {
+                    if let Some(view) = this.upgrade() {
+                        let _ = view.update(&mut app, |this, cx| {
+                            this.apply_event(event);
+                            cx.notify();
+                        });
+                    } else {
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .detach();
 }
 
@@ -541,7 +570,10 @@ fn start_auth(
         match login_result {
             Ok(result) => {
                 let size = result.saml_response.len();
-                send_status(&status_tx, &format!("Captured SAMLResponse ({} bytes)", size));
+                send_status(
+                    &status_tx,
+                    &format!("Captured SAMLResponse ({} bytes)", size),
+                );
 
                 if accounts.is_empty() {
                     let _ = status_tx.send_blocking(AuthEvent::Finished {
@@ -552,14 +584,10 @@ fn start_auth(
                 }
 
                 let status_tx_aws = status_tx.clone();
-                let sts_result = aws::assume_roles_with_saml(
-                    &result.saml_response,
-                    &accounts,
-                    |message| {
-                        let _ =
-                            status_tx_aws.send_blocking(AuthEvent::Status(message.to_string()));
-                    },
-                );
+                let sts_result =
+                    aws::assume_roles_with_saml(&result.saml_response, &accounts, |message| {
+                        let _ = status_tx_aws.send_blocking(AuthEvent::Status(message.to_string()));
+                    });
 
                 match sts_result {
                     Ok(creds) => match aws::write_credentials(&creds) {
@@ -583,16 +611,15 @@ fn start_auth(
                                     Err(err) => {
                                         send_status(
                                             &status_tx,
-                                            &format!(
-                                                "Failed to set default profile: {err:?}"
-                                            ),
+                                            &format!("Failed to set default profile: {err:?}"),
                                         );
                                     }
                                 }
                             }
 
                             let labels = accounts.iter().map(|a| a.label.clone()).collect();
-                            let _ = status_tx.send_blocking(AuthEvent::CredentialsUpdated { labels });
+                            let _ =
+                                status_tx.send_blocking(AuthEvent::CredentialsUpdated { labels });
                             let _ = status_tx.send_blocking(AuthEvent::Finished {
                                 profile: login.name.clone(),
                                 accounts: creds.len(),
@@ -629,9 +656,14 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        let window_bounds = WindowBounds::centered(size(px(600.), px(800.)), cx);
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
+            let window_options = WindowOptions {
+                window_bounds: Some(window_bounds),
+                ..WindowOptions::default()
+            };
+            cx.open_window(window_options, |window, cx| {
                 let view = cx.new(|cx| AppState::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })?;

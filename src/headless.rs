@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use headless_chrome::{
-    Browser, LaunchOptionsBuilder, Tab,
-    protocol::cdp::Fetch::{RequestPattern, RequestStage, events::RequestPausedEvent},
+    protocol::cdp::Fetch::{events::RequestPausedEvent, RequestPattern, RequestStage}, Browser, LaunchOptionsBuilder,
+    Tab,
 };
 use serde_json::Value as JsonValue;
 use totp_rs::{Algorithm, Secret, TOTP};
