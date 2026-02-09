@@ -4,6 +4,7 @@ use gpui::{div, Context, FontWeight, ParentElement, Styled};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_component::{h_flex, Disableable, IconName, StyledExt};
+use gpui_component::spinner::Spinner;
 
 pub(crate) fn account_card(
     account: &AwsAccount,
@@ -13,6 +14,7 @@ pub(crate) fn account_card(
     login: LoginProfile,
     accounts_list: Vec<AwsAccount>,
     default_profile: Option<&str>,
+    auth_in_progress: bool,
     cx: &mut Context<AppState>,
 ) -> GroupBox {
     let mut group = GroupBox::new();
@@ -53,12 +55,17 @@ pub(crate) fn account_card(
                 )
                 .child(div().child(account.saml_provider.clone())),
         )
-        .child(
+        .child({
+            let status_value = if auth_in_progress {
+                div().child(Spinner::new())
+            } else {
+                div().child(expiration)
+            };
             h_flex()
                 .gap_2()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Status:"))
-                .child(div().child(expiration)),
-        )
+                .child(status_value)
+        })
         .child(
             div().h_flex().gap_2().child(
                 Button::new(("set-default", index))

@@ -5,7 +5,11 @@ mod ui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use gpui::*;
@@ -37,6 +41,8 @@ enum AuthEvent {
     CredentialsUpdated { labels: Vec<String> },
 }
 
+const AUTH_TIMEOUT: Duration = Duration::from_secs(45);
+
 pub struct AppState {
     config: Result<Config, String>,
     status: String,
@@ -44,6 +50,7 @@ pub struct AppState {
     status_tx: Sender<AuthEvent>,
     headless: bool,
     view: ViewMode,
+    auth_in_progress: bool,
     config_editor: Entity<InputState>,
     aws_select: Entity<SelectState<SearchableVec<String>>>,
     default_profile: Option<String>,
@@ -137,6 +144,7 @@ impl AppState {
             status_tx,
             headless: true,
             view: ViewMode::Profiles,
+            auth_in_progress: false,
             config_editor,
             aws_select,
             default_profile,
@@ -232,7 +240,9 @@ impl AppState {
     fn push_status(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.status = message.clone();
-        self.status_log.push(message);
+        let timestamp = format_timestamp();
+        self.status_log
+            .push(format!("[{timestamp}] {message}"));
         if self.status_log.len() > 8 {
             let overflow = self.status_log.len() - 8;
             self.status_log.drain(0..overflow);
@@ -275,6 +285,7 @@ impl AppState {
                     "Credentials for {} expired or missing; re-authenticating",
                     label
                 ));
+                self.auth_in_progress = true;
                 start_auth(
                     login,
                     accounts,
@@ -290,9 +301,11 @@ impl AppState {
         match event {
             AuthEvent::Status(message) => self.push_status(message),
             AuthEvent::Finished { profile, accounts } => {
+                self.auth_in_progress = false;
                 self.push_status(format!("Completed {} ({} accounts)", profile, accounts));
             }
             AuthEvent::Failed { profile, error } => {
+                self.auth_in_progress = false;
                 self.push_status(format!("Auth failed for {}: {}", profile, error));
             }
             AuthEvent::CredentialsUpdated { labels } => {
@@ -354,6 +367,7 @@ impl Render for AppState {
                                 login,
                                 accounts_list,
                                 default_profile,
+                                self.auth_in_progress,
                                 cx,
                             );
                             accounts = accounts.child(card.mb_2());
@@ -367,11 +381,13 @@ impl Render for AppState {
                         Button::new("auth-all")
                             .icon(IconName::User)
                             .label("Authenticate And Assume Roles")
+                            .disabled(self.auth_in_progress)
                             .on_click(cx.listener(move |this, _event, _window, _cx| {
                                 this.push_status(format!(
                                     "Authenticating {}...",
                                     login.name.clone()
                                 ));
+                                this.auth_in_progress = true;
                                 start_auth(
                                     login.clone(),
                                     accounts.clone(),
@@ -527,6 +543,17 @@ impl Render for AppState {
     }
 }
 
+fn format_timestamp() -> String {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return "??:??:??".to_string();
+    };
+    let secs = now.as_secs() % 86_400;
+    let hours = secs / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
 fn start_status_listener(cx: &mut Context<AppState>, status_rx: Receiver<AuthEvent>) {
     cx.spawn(
         move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
@@ -557,18 +584,46 @@ fn start_auth(
     default_profile: Option<String>,
 ) {
     std::thread::spawn(move || {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let timeout_tx = status_tx.clone();
+        let timeout_login = login.name.clone();
+        let timeout_cancelled = Arc::clone(&cancelled);
+        let timeout_finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            std::thread::sleep(AUTH_TIMEOUT);
+            if timeout_finished.load(Ordering::SeqCst) {
+                return;
+            }
+            timeout_cancelled.store(true, Ordering::SeqCst);
+            let _ = timeout_tx.send_blocking(AuthEvent::Failed {
+                profile: timeout_login,
+                error: format!("Authentication timed out after {}s", AUTH_TIMEOUT.as_secs()),
+            });
+        });
+
         let send_status = |tx: &Sender<AuthEvent>, message: &str| {
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
             let _ = tx.send_blocking(AuthEvent::Status(message.to_string()));
         };
         send_status(&status_tx, "Starting auth flow");
 
         let status_tx_login = status_tx.clone();
         let login_result = headless::run_profile(&login, headless, |message| {
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
             let _ = status_tx_login.send_blocking(AuthEvent::Status(message.to_string()));
         });
 
         match login_result {
             Ok(result) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
                 let size = result.saml_response.len();
                 send_status(
                     &status_tx,
@@ -576,22 +631,32 @@ fn start_auth(
                 );
 
                 if accounts.is_empty() {
-                    let _ = status_tx.send_blocking(AuthEvent::Finished {
-                        profile: login.name.clone(),
-                        accounts: 0,
-                    });
+                    if !cancelled.load(Ordering::SeqCst) {
+                        let _ = status_tx.send_blocking(AuthEvent::Finished {
+                            profile: login.name.clone(),
+                            accounts: 0,
+                        });
+                    }
+                    finished.store(true, Ordering::SeqCst);
                     return;
                 }
 
                 let status_tx_aws = status_tx.clone();
                 let sts_result =
                     aws::assume_roles_with_saml(&result.saml_response, &accounts, |message| {
-                        let _ = status_tx_aws.send_blocking(AuthEvent::Status(message.to_string()));
+                        if cancelled.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ =
+                            status_tx_aws.send_blocking(AuthEvent::Status(message.to_string()));
                     });
 
                 match sts_result {
                     Ok(creds) => match aws::write_credentials(&creds) {
                         Ok(path) => {
+                            if cancelled.load(Ordering::SeqCst) {
+                                return;
+                            }
                             send_status(
                                 &status_tx,
                                 &format!("Credentials written to {}", path.display()),
@@ -618,33 +683,45 @@ fn start_auth(
                             }
 
                             let labels = accounts.iter().map(|a| a.label.clone()).collect();
-                            let _ =
-                                status_tx.send_blocking(AuthEvent::CredentialsUpdated { labels });
-                            let _ = status_tx.send_blocking(AuthEvent::Finished {
-                                profile: login.name.clone(),
-                                accounts: creds.len(),
-                            });
+                            if !cancelled.load(Ordering::SeqCst) {
+                                let _ = status_tx
+                                    .send_blocking(AuthEvent::CredentialsUpdated { labels });
+                                let _ = status_tx.send_blocking(AuthEvent::Finished {
+                                    profile: login.name.clone(),
+                                    accounts: creds.len(),
+                                });
+                            }
+                            finished.store(true, Ordering::SeqCst);
                         }
                         Err(err) => {
-                            let _ = status_tx.send_blocking(AuthEvent::Failed {
-                                profile: login.name.clone(),
-                                error: format!("Failed to write credentials: {err:?}"),
-                            });
+                            if !cancelled.load(Ordering::SeqCst) {
+                                let _ = status_tx.send_blocking(AuthEvent::Failed {
+                                    profile: login.name.clone(),
+                                    error: format!("Failed to write credentials: {err:?}"),
+                                });
+                            }
+                            finished.store(true, Ordering::SeqCst);
                         }
                     },
                     Err(err) => {
-                        let _ = status_tx.send_blocking(AuthEvent::Failed {
-                            profile: login.name.clone(),
-                            error: format!("STS exchange failed: {err:?}"),
-                        });
+                        if !cancelled.load(Ordering::SeqCst) {
+                            let _ = status_tx.send_blocking(AuthEvent::Failed {
+                                profile: login.name.clone(),
+                                error: format!("STS exchange failed: {err:?}"),
+                            });
+                        }
+                        finished.store(true, Ordering::SeqCst);
                     }
                 }
             }
             Err(err) => {
-                let _ = status_tx.send_blocking(AuthEvent::Failed {
-                    profile: login.name.clone(),
-                    error: format!("{err:?}"),
-                });
+                if !cancelled.load(Ordering::SeqCst) {
+                    let _ = status_tx.send_blocking(AuthEvent::Failed {
+                        profile: login.name.clone(),
+                        error: format!("{err:?}"),
+                    });
+                }
+                finished.store(true, Ordering::SeqCst);
                 eprintln!("Auth failed for {}: {err:?}", login.name);
             }
         }
